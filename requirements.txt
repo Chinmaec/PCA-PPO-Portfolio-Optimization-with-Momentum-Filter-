@@ -1,0 +1,9 @@
+# Tested versions used during development.
+# You can try newer compatible versions if installation issues occur.
+
+matplotlib>=3.8,<4
+numpy>=2.0,<3
+pandas>=2.2,<3
+torch>=2.2,<3
+
+
