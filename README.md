@@ -28,7 +28,6 @@ Classical portfolio methods are often static. This project explores a dynamic al
 - `agent.py` - PPO policy/critic and training loop
 - `backtest.py` - performance metrics and plots
 - `sample_data.csv` - sample dataset
-- `making_sample_data.ipynb` - data preparation notebook
 
 ## Installation
 ```bash
@@ -39,3 +38,24 @@ python -m venv .venv
 # source .venv/bin/activate
 
 pip install -r requirements.txt
+```
+
+## Usage
+```bash
+python run.py
+```
+
+## Expected Output 
+```bash
+[INFO] Loading data from sample_data.csv
+[INFO] Train period: 2015-01-01 to 2021-12-31 | Test period: 2022-01-01 to 2023-12-31
+[INFO] PCA factors retained: 5 (explained variance: 82.4%)
+[TRAIN] Episode 010 | Reward: 0.0124 | Turnover: 0.084 | Cost: 0.0011
+[TRAIN] Episode 020 | Reward: 0.0189 | Turnover: 0.071 | Cost: 0.0009
+...
+[TEST] PPO CAGR: 14.2% | Sharpe: 1.18 | Max Drawdown: -11.6%
+[TEST] EQW CAGR: 10.5% | Sharpe: 0.91 | Max Drawdown: -14.8%
+```
+<img src="C:\Users\Akhilesh Tayade\Downloads\Figure_1 (1).png" alt="Equity Curve" width="700"/>
+
+
