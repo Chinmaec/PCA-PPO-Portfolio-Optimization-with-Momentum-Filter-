@@ -2,12 +2,73 @@
 import numpy as np
 import pandas as pd
 
+import os
+from concurrent.futures import ProcessPoolExecutor
+
+# Worker globals (set once per process)
+G_RETURNS = None
+G_LOOKBACK = None
+
+def _init_worker(returns_np, lookback):
+    global G_RETURNS, G_LOOKBACK
+    G_RETURNS = returns_np
+    G_LOOKBACK = lookback
+
+def run_one_i(tt):
+    rw = G_RETURNS[tt - G_LOOKBACK:tt]
+    mom = rw.sum(axis=0)
+    cut = np.percentile(mom, 10)
+    return tt, mom, cut
+
+def run_one_chunk(tt_chunk):
+    out = []
+    for tt in tt_chunk:
+        out.append(run_one_i(tt))
+    return out
+
+def _chunked(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+def _mom_cut_worker(args):
+    returns_np, lookback, t_chunk = args
+    out = []
+    for tt in t_chunk:
+        rw = returns_np[tt - lookback:tt]
+        mom = rw.sum(axis=0)
+        cut = np.percentile(mom, 10)
+        out.append((tt, mom, cut))
+    return out
+
+def build_mom_cut_cache_parallel(returns_np, lookback, workers=None, chunk_size=256):
+    T, n_stocks = returns_np.shape
+    mom_cache = np.zeros((T, n_stocks), dtype=np.float64)
+    cut_cache = np.zeros(T, dtype=np.float64)
+
+    idxs = list(range(lookback, T))
+    if not idxs:
+        return mom_cache, cut_cache
+
+    if workers is None:
+        workers = min(8, max(1, (os.cpu_count() or 12) - 1))
+
+    idx_chunks = list(_chunked(idxs, chunk_size))
+    tasks = [(returns_np, lookback, ch) for ch in idx_chunks]
+
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        for chunk_result in ex.map(_mom_cut_worker, tasks):
+            for tt, mom, cut in chunk_result:
+                mom_cache[tt] = mom
+                cut_cache[tt] = cut
+
+    return mom_cache, cut_cache
+        
 class Portfolio_Env: 
 
     """
     RL PORTFOLIO ENVIRONMENT
 
-    CORE LOOP: state  → agent picks weights → portfolio return → reward → new state
+    CORE LOOP: state  ? agent picks weights ? portfolio return ? reward ? new state
     State  : last N days of PCA factors  
     Action : portfolio weights for each stock 
     Reward : portfolio return that day  (profit = positive, loss = negative)
@@ -21,14 +82,86 @@ class Portfolio_Env:
         transaction_cost=0.001,
         rebalance_every=1,          # keep this, but set to 1 in run.py
         min_holding_days=7,         # per-ticker minimum holding period
-        min_weight_change=0.01      # 1% threshold (use 0.02 for 2%)
+        min_weight_change=0.01,      # 1% threshold (use 0.02 for 2%)
+        store_history = True,
+        cache_workers = 1, 
+        cache_chunk_size = 256,
     ):
-        self.returns = returns.values
-        self.factors = pca_factors.values
+        # self.returns = returns.values
+        # self.factors = pca_factors.values
         self.n_stocks = returns.shape[1]
         self.n_factors = pca_factors.shape[1]
+        self.store_history = bool(store_history)
         self.lookback = lookback
         self.T = len(returns)
+
+        # Precompute momentum + percentile cut for each t to avoid repeated work in step()
+        # self._mom_cache = np.zeros((self.T, self.n_stocks), dtype=np.float64)
+        # self._mom_cache, self._cut_cache = build_mom_cut_cache_parallel(
+        #     self.returns,
+        #     self.lookback,
+        #     workers=cache_workers,
+        #     chunk_size=cache_chunk_size)
+        
+        # self._cut_cache = np.zeros(self.T, dtype=np.float64)
+
+        # for tt in range(self.lookback, self.T):
+        #     rw = self.returns[tt - self.lookback : tt]
+        #     mom = rw.sum(axis=0)
+        #     self._mom_cache[tt] = mom
+        #     self._cut_cache[tt] = np.percentile(mom, 10)
+
+        # environment.py  -> inside __init__ (replace your current returns/factors + cache init block)
+
+        self.returns = returns.values.astype(np.float32, copy=False)
+        self.factors = pca_factors.values.astype(np.float32, copy=False)
+
+        self._mom_cache = np.zeros((self.T, self.n_stocks), dtype=np.float32)
+        self._cut_cache = np.zeros(self.T, dtype=np.float32)
+
+        if self.T > self.lookback:
+            csum = np.cumsum(self.returns, axis=0, dtype=np.float64)
+            mom_valid = csum[self.lookback - 1 : self.T - 1].copy()
+            mom_valid[1:] -= csum[: self.T - self.lookback - 1]
+            cut_valid = np.percentile(mom_valid, 10, axis=1)
+
+            self._mom_cache[self.lookback:] = mom_valid.astype(np.float32, copy=False)
+            self._cut_cache[self.lookback:] = cut_valid.astype(np.float32, copy=False)
+
+        # cache all flattened states once
+        self._state_cache = np.empty(
+            (max(0, self.T - self.lookback), self.lookback * self.n_factors),
+            dtype=np.float32
+        )
+        for tt in range(self.lookback, self.T):
+            self._state_cache[tt - self.lookback] = self.factors[tt - self.lookback:tt].reshape(-1)
+
+        self.last_info = None
+
+
+        # idxs = list(range(self.lookback, self.T))
+
+        # if cache_workers is None:
+        #     cache_workers = min(8, max(1, (os.cpu_count() or 12) - 1))
+
+        # if cache_workers <= 1 or len(idxs) < cache_chunk_size:
+        #     for tt in idxs:
+        #         rw = self.returns[tt - self.lookback:tt]
+        #         mom = rw.sum(axis=0)
+        #         self._mom_cache[tt] = mom
+        #         self._cut_cache[tt] = np.percentile(mom, 10)
+        # else:
+        #     idx_chunks = list(_chunked(idxs, cache_chunk_size))
+        #     with ProcessPoolExecutor(
+        #         max_workers=cache_workers,
+        #         initializer=_init_worker,
+        #         initargs=(self.returns, self.lookback),
+        #     ) as ex:
+        #         for chunk_result in ex.map(run_one_chunk, idx_chunks):
+        #             for tt, mom, cut in chunk_result:
+        #                 self._mom_cache[tt] = mom
+        #                 self._cut_cache[tt] = cut
+
 
         if (transaction_cost is None) or (transaction_cost < 0):
             transaction_cost = 0.001
@@ -93,13 +226,21 @@ class Portfolio_Env:
         day_idx = self.t - self.lookback
         return (day_idx % self.rebalance_every) == 0
     
-    # State
-    def get_state(self):
-        "State : flattened PCA factors window over lookback period"
-        "Shape : lookback x n_factors"
+    # # State
+    # def get_state(self):
+    #     "State : flattened PCA factors window over lookback period"
+    #     "Shape : lookback x n_factors"
 
-        window = self.factors[self.t - self.lookback : self.t] 
-        return window.flatten()
+    #     window = self.factors[self.t - self.lookback : self.t] 
+    #     return window.flatten()
+
+    # environment.py -> replace get_state()
+
+    def get_state(self):
+        if self.t < self.lookback or self.t >= self.T:
+            return None
+        return self._state_cache[self.t - self.lookback]
+
 
     # Reset
     def reset(self):
@@ -115,6 +256,7 @@ class Portfolio_Env:
         self.last_trade_t = np.full(self.n_stocks, self.t - self.min_holding_days, dtype= int)
 
         self.history = []
+        self.last_info = None
         return self.get_state()  
     
     def step(self,weights):
@@ -132,10 +274,15 @@ class Portfolio_Env:
             target_weights = self._softmax(weights)
 
             # Momentum filter from lookback window
-            returns_window = self.returns[self.t - self.lookback : self.t]
-            momentum = returns_window.sum(axis=0)
-            cut = np.percentile(momentum, 10)
+            # returns_window = self.returns[self.t - self.lookback : self.t]
+            # momentum = returns_window.sum(axis=0)
+            # cut = np.percentile(momentum, 10)
+            # mask = (momentum > cut).astype(float)
+
+            momentum = self._mom_cache[self.t]
+            cut = self._cut_cache[self.t]
             mask = (momentum > cut).astype(float)
+
 
             # Apply mask, then renormalize so capital stays fully invested
             target_weights = target_weights * mask
@@ -223,31 +370,42 @@ class Portfolio_Env:
         self.equal_prev_weights = self.equal_current_weights.copy()
 
 
-        # Reward = agent's return − equal weight return
+        # Reward = agent's return ? equal weight return
         # Positive reward = agent beat the benchmark today
         # Negative reward = agent underperformed benchmark today
         # reward = port_return_net - equal_return
         reward = (port_return_net - equal_return- 0.1 * turnover)
 
-        # # Log 
-        self.history.append({
-            "t": self.t,
-            "traded": traded,
-            "turnover": turnover,
-            "transaction_cost": tc,
-            "weights": target_weights.copy(),
-            "port_return_gross": port_return_gross,
-            "port_return": port_return_net,   # net return after costs
+        # Log 
 
-            "equal_turnover": equal_turnover,
-            "equal_transaction_cost": equal_tc,
-            "equal_return_gross": equal_return_gross,
+        # environment.py -> inside step(), add just before "if self.store_history:"
+
+        self.last_info = {
+            "port_return": port_return_net,
             "equal_return": equal_return,
+            "weights": target_weights.copy(),
+            "t": self.t,
+        }
 
-            "port_value": self.portfolio_value,
-            "equal_value": self.equal_value,
-            "reward": reward
-        })
+        if self.store_history:
+            self.history.append({
+                "t": self.t,
+                "traded": traded,
+                "turnover": turnover,
+                "transaction_cost": tc,
+                "weights": target_weights.copy(),
+                "port_return_gross": port_return_gross,
+                "port_return": port_return_net,   # net return after costs
+
+                "equal_turnover": equal_turnover,
+                "equal_transaction_cost": equal_tc,
+                "equal_return_gross": equal_return_gross,
+                "equal_return": equal_return,
+
+                "port_value": self.portfolio_value,
+                "equal_value": self.equal_value,
+                "reward": reward
+            })
 
         # Advance time 
         self.t += 1
