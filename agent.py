@@ -16,10 +16,10 @@ class PolicyNetwork(nn.Module):
             nn.ReLU(),
         )
 
-        # Actor head — outputs raw portfolio weights
+        # Actor head (output: raw portfolio weights)
         self.actor  = nn.Linear(hidden, action_dim)
 
-        # Critic head — outputs a scalar: "how good is this state?"
+        # Critic head (output: scalar- how good is this state?)
         self.critic = nn.Linear(hidden, 1)
 
     def forward(self, x):
@@ -36,13 +36,14 @@ class PPOAgent:
                  lr=3e-4, gamma=0.99, clip_eps=0.2, epochs=2):
         """
         lr        : learning rate
-        gamma     : discount factor: gamma=0.99 -> reward 100 days later is worth 0.99^100 ≈ 37% now
+        gamma     : discount factor: gamma=0.99 -> reward 100 days later is worth 0.99^100 ? 37% now
         clip_eps  : PPO clip threshold (standard = 0.2)
         epochs    : how many gradient steps per batch of experience
         """
         self.gamma    = gamma
         self.clip_eps = clip_eps
         self.epochs   = epochs
+        self._eps     = 1e-8
 
         self.net      = PolicyNetwork(state_dim, action_dim)
         self.opt      = optim.Adam(self.net.parameters(), lr=lr)
@@ -56,24 +57,31 @@ class PPOAgent:
           - log_prob : log probability of this action (needed for PPO update)
           - value    : critic's estimate of state value
         """
-        state_t = torch.FloatTensor(state).unsqueeze(0)   # add batch dim
+        # state_t = torch.FloatTensor(state).unsqueeze(0)   # add batch dim
+        state_t = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0)
+
 
         with torch.no_grad():
             weights, value = self.net(state_t)
-
-        # action ~ N(mu, sigma^2)  μ = network output, σ = fixed 0.1
-        dist    = torch.distributions.Normal(weights, torch.ones_like(weights) * self.action_std)
+        
+        b = self.action_std / np.sqrt(2.0)  # variance-matched to Normal std
+        dist = torch.distributions.Laplace(weights, torch.full_like(weights, b))
 
         if deterministic:
             action = weights
-            log_prob = dist.log_prob(action).sum()
+            log_prob = 0.0  # not used in backtest
         else:
+            # std = torch.full_like(weights, self.action_std)
+            # dist = torch.distributions.Normal(weights, std)
             action = dist.sample()
-            log_prob = dist.log_prob(action).sum()
+            log_prob = dist.log_prob(action).sum().item()
 
-        return (action.squeeze().numpy(),
-                log_prob.item(),
-                value.squeeze().item())
+        return (
+            action.squeeze().cpu().numpy(),
+            log_prob,
+            value.squeeze().item()
+        )
+        
 
     # Learn
     def learn(self, batch):
@@ -87,11 +95,13 @@ class PPOAgent:
         4. MSE loss on critic
         5. Gradient step
         """
-        states   = torch.FloatTensor(np.array([b[0] for b in batch]))
-        actions  = torch.FloatTensor(np.array([b[1] for b in batch]))
-        old_lps  = torch.FloatTensor([b[2] for b in batch])
         rewards  = [b[3] for b in batch]
-        values   = torch.FloatTensor([b[4] for b in batch])
+
+        states  = torch.as_tensor(np.array([b[0] for b in batch]), dtype=torch.float32)
+        actions = torch.as_tensor(np.array([b[1] for b in batch]), dtype=torch.float32)
+        old_lps = torch.as_tensor([b[2] for b in batch], dtype=torch.float32)
+        values  = torch.as_tensor([b[4] for b in batch], dtype=torch.float32)
+
 
         # 1. Discounted returns 
         G, returns = 0, []
@@ -103,15 +113,16 @@ class PPOAgent:
         # 2. Advantage
         
         # A_t = G_t - V(s_t)
-        # Positive/ Negative advantage → action was BETTER than the baseline/ action was WORSE  than the baseline expected
+        # Positive/ Negative advantage ? action was better/ worse than the baseline expected
         advantages = returns - values
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + self._eps)
 
         # 3+4. PPO Loss 
         for _ in range(self.epochs):
             weights_new, values_new = self.net(states)
-            dist    = torch.distributions.Normal(weights_new,
-                            torch.ones_like(weights_new) * self.action_std)
+
+            b = self.action_std / np.sqrt(2.0)
+            dist = torch.distributions.Laplace(weights_new, torch.full_like(weights_new, b))
             new_lps  = dist.log_prob(actions).sum(dim=1)
 
             ratio    = torch.exp(new_lps - old_lps) # Probability ratio
